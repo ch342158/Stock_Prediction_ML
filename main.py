@@ -11,7 +11,10 @@ import sys
 import tkinter as tk
 from tkinter import ttk
 from tkinter import messagebox
-
+from keras.callbacks import EarlyStopping
+from keras.layers import BatchNormalization
+from sklearn.metrics import r2_score
+import ta
 sys.stdout.reconfigure(encoding='utf-8')
 
 def download_data(ticker, start_date, end_date):
@@ -34,18 +37,40 @@ def create_dataset(dataset, time_step=60):
         Y.append(dataset[i + time_step, 0])
     return np.array(X), np.array(Y)
 
-def build_model(input_shape):
+def build_optimized_model(input_shape):
     model = Sequential()
     model.add(LSTM(units=50, return_sequences=True, input_shape=input_shape))
-    model.add(Dropout(0.2))
+    model.add(Dropout(0.3))  # Increased Dropout
+    model.add(BatchNormalization())  # Added Batch Normalization
     model.add(LSTM(units=50, return_sequences=False))
-    model.add(Dropout(0.2))
+    model.add(Dropout(0.3))  # Increased Dropout
     model.add(Dense(units=1))
     model.compile(optimizer='adam', loss='mean_squared_error')
     return model
 
-def train_model(model, X_train, y_train, epochs=100, batch_size=32):
-    model.fit(X_train, y_train, epochs=epochs, batch_size=batch_size, verbose=1)
+
+def train_optimized_model(model, X_train, y_train, X_test, y_test, epochs=100, batch_size=32):
+    early_stopping = EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True)
+
+    history = model.fit(
+        X_train, y_train,
+        epochs=epochs,
+        batch_size=batch_size,
+        validation_data=(X_test, y_test),
+        callbacks=[early_stopping],
+        verbose=1
+    )
+
+    plt.figure(figsize=(10, 6))
+    plt.plot(history.history['loss'], label='Training Loss')
+    plt.plot(history.history['val_loss'], label='Validation Loss')
+    plt.title('Training vs Validation Loss')
+    plt.xlabel('Epochs')
+    plt.ylabel('Loss')
+    plt.legend()
+    plt.show()
+
+    return model
 
 def make_predictions(model, X_train, X_test, scaler):
     train_predict = model.predict(X_train)
@@ -54,7 +79,22 @@ def make_predictions(model, X_train, X_test, scaler):
     test_predict = scaler.inverse_transform(test_predict)
     return train_predict, test_predict
 
-def simulate_future_predictions(model, scaled_data, scaler, future_days, time_step=60):
+def simulate_future_predictions_with_volatility(model, scaled_data, scaler, future_days, historical_data, time_step=60, scale=0.1):
+    """
+    Simulates future stock price predictions and adds volatility.
+
+    Args:
+        model (Sequential): Trained LSTM model.
+        scaled_data (np.array): Scaled historical stock data.
+        scaler (MinMaxScaler): Scaler used to transform the data.
+        future_days (int): Number of business days to predict.
+        historical_data (pd.Series): Original historical stock prices.
+        time_step (int): Number of time steps for prediction (default 60).
+        scale (float): Scale factor for volatility (default 0.1).
+
+    Returns:
+        pd.DataFrame: Future predictions with added volatility.
+    """
     future_dates = pd.date_range(start=datetime.now().date() + timedelta(days=1), periods=future_days, freq='B')
     last_60_days = scaled_data[-time_step:]
     last_60_days_scaled = last_60_days.reshape(1, last_60_days.shape[0], 1)
@@ -65,19 +105,44 @@ def simulate_future_predictions(model, scaled_data, scaler, future_days, time_st
         future_prediction = scaler.inverse_transform(prediction)
         future_predictions.append(future_prediction[0, 0])
 
-        prediction_reshaped = prediction.reshape(1, 1, 1)
+        prediction_reshaped = scaler.transform([[future_prediction[0, 0]]]).reshape(1, 1, 1)
         last_60_days_scaled = np.append(last_60_days_scaled[:, 1:, :], prediction_reshaped, axis=1)
 
-    future_df = pd.DataFrame(future_predictions, index=future_dates, columns=['Future Predicted Stock Price'])
+    # Add volatility to the predictions
+    future_predictions_with_volatility = add_volatility(
+        np.array(future_predictions), historical_data, scale=scale
+    )
+
+    future_df = pd.DataFrame(future_predictions_with_volatility, index=future_dates, columns=['Future Predicted Stock Price'])
     return future_df
 
-def plot_results(data, train_predict, test_predict, time_step):
+
+
+def add_volatility(predictions, historical_data, scale=0.1):
+    """
+    Adds random noise proportional to historical volatility to the predictions.
+
+    Args:
+        predictions (np.array): Predicted stock prices.
+        historical_data (pd.Series): Historical stock prices.
+        scale (float): Scale factor for the noise (default 0.1).
+
+    Returns:
+        np.array: Predictions with added volatility.
+    """
+    volatility = np.std(historical_data[-60:])  # Calculate recent volatility
+    noise = np.random.normal(0, scale * volatility, size=len(predictions))
+    predictions_with_volatility = predictions + noise
+    return predictions_with_volatility
+
+
+def plot_combined_results(data, train_predict, test_predict, time_step):
     plt.figure(figsize=(14, 5))
-    plt.plot(data.index, data['Close'], label='Actual Stock Price')
+    plt.plot(data.index, data['Close'], label='Actual Stock Price', color='blue')
     train_dates = data.index[time_step:time_step + len(train_predict)]
-    plt.plot(train_dates, train_predict, label='Train Predicted Stock Price')
+    plt.plot(train_dates, train_predict, label='Train Predicted Stock Price', color='green')
     test_dates = data.index[time_step + len(train_predict) + 1:time_step + len(train_predict) + 1 + len(test_predict)]
-    plt.plot(test_dates, test_predict, label='Test Predicted Stock Price')
+    plt.plot(test_dates, test_predict, label='Test Predicted Stock Price', color='orange')
     plt.xlabel('Date')
     plt.ylabel('Stock Price')
     plt.legend()
@@ -93,7 +158,6 @@ def plot_future_predictions(data, future_df):
     plt.show()
 
 def run_predictions():
-    # Parameters
     ticker = ticker_entry.get()
     start_date = start_date_entry.get()
     end_date = end_date_entry.get()
@@ -122,14 +186,16 @@ def run_predictions():
     X_train = X_train.reshape(X_train.shape[0], X_train.shape[1], 1)
     X_test = X_test.reshape(X_test.shape[0], X_test.shape[1], 1)
 
-    model = build_model((X_train.shape[1], 1))
-    train_model(model, X_train, y_train, epochs=100, batch_size=32)
+    model = build_optimized_model((X_train.shape[1], 1))
+    model = train_optimized_model(model, X_train, y_train, X_test, y_test, epochs=100, batch_size=32)
 
     train_predict, test_predict = make_predictions(model, X_train, X_test, scaler)
+    test_predict_actual = evaluate_performance(model, X_test, y_test, scaler)
 
-    plot_results(data, train_predict, test_predict, 60)
+    plot_combined_results(data, train_predict, test_predict, 60)
 
-    future_df = simulate_future_predictions(model, scaled_data, scaler, future_days, time_step=60)
+    # Use the updated function to add volatility to predictions
+    future_df = simulate_future_predictions_with_volatility(model, scaled_data, scaler, future_days, data['Close'], time_step=60)
 
     plot_future_predictions(data, future_df)
 
@@ -137,6 +203,15 @@ def run_predictions():
     print(future_df)
 
 
+def evaluate_performance(model, X_test, y_test, scaler):
+    test_predict = model.predict(X_test)
+    test_predict = scaler.inverse_transform(test_predict)
+    y_test_actual = scaler.inverse_transform(y_test.reshape(-1, 1))
+
+    r2 = r2_score(y_test_actual, test_predict)
+    print(f"R² Score on Test Data: {r2:.4f}")
+
+    return test_predict
 root = tk.Tk()
 root.title("Stock Price Prediction")
 
